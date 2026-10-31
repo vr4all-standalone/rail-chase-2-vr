@@ -1,0 +1,12 @@
+--- a/src/mame/sega/model2_v.cpp
++++ b/src/mame/sega/model2_v.cpp
+@@ -2514,7 +2514,8 @@
+         rchase2::copy_pixels(frame->native,frame->width,frame->height,[&](int x,int y){return bitmap.pix(y,x);});
+         frame->complete=true;
+         rchase2::live_proof(*frame);
+-        rchase2::shared_runtime().scene.store(std::shared_ptr<const rchase2::NativeFrame>(frame.release()));
++        if(rchase2::live_reuse_frames())rchase2::shared_runtime().scene.store(rchase2::live_frame_pool().publish(std::move(frame)));
++        else rchase2::shared_runtime().scene.store(std::shared_ptr<const rchase2::NativeFrame>(frame.release()));
+     }
+     if(!rchase2::trace_pending_raster().empty()) {
+         try {

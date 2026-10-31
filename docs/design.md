@@ -1,0 +1,15 @@
+# Rail Chase 2 VR design
+
+Implement the original Rail Chase 2 Revision A (`rchase2`) for Quest 3/3S and Windows OpenXR using the accepted VC2/Gunblade Model 2 architecture. Native stereo geometry, tracked head and guns, original audio and native game speed are the target. Software compilation and synthetic rendering do not establish headset playability.
+
+MAME 0.289 is pinned to `f34f02505e32c1993c6a782b6814232cbfc74e36`. This is Model 2B with i960, SHARC geometry, SCSP audio and a separate 4 MHz Z80 I/O board. Validate the complete ROM manifest, including `epr-17895.ic8`, by size, CRC32 and SHA1. Revision A ADC channels are P2 X, P1 X, P2 Y, P1 Y. All axes are reversed; P1/P2 X limits and centers differ. Triggers are IN1 active-low bits 1/2, while native coin/start/test/service use IN0. IN2 is unused. Do not inherit VC2 serial lightgun/offscreen reload or Gunblade calibration/RAM addresses.
+
+Reuse selected licensed OpenXR, scene capture/renderer, controller models, purple VR4ALL presentation, settings and packaging modules with source provenance. Implement the Rail Chase 2 cabinet and native-state adapter separately. Player readiness/join/continue, accepted shots, calibration and original weapon extraction require evidence from this game's loaded program and native runs; unknown states fail closed. Do not invent reload, ammunition, weapons or physical gun feedback. The original drive board is preserved.
+
+Required common behavior is independent rendering/emulation pacing; tracked stereo world; P1/P2 start/join/continue using real inputs and acknowledgements; reversible saved P1-left/P1-right mapping and solo hand transfer; release guards over focus/menu/mapping changes; startup instructions; original audio; purple settings, recenter, gun angle/size, laser, four haptics levels, world/panel sizing, How to play, native Service/calibration and two-step Quit. Unsupported choices must be recorded and shown accurately. Media and NVRAM remain separate; app updates preserve state.
+
+Independent identity: `com.vrlightgunhub.rchase2`, native namespace/library `rchase2`, private settings `rchase2-settings.ini`. New small source lives here; all compiler, private media and scene captures live under `D:/VR4ALL-RailChase2-Build`. Never mutate sibling engines, original media, installer or excluded/paused projects. No publishing or headset installation is authorized for this agent.
+
+Telemetry exposure is explicitly deferred by the user. Preserve the native drive-board read/write seam (`rchase2_drive_board_r/w`) and keep internal evidence snapshots separate from a future external telemetry API. A later task must identify command meanings/units/timing, define versioned opt-in transport and validate real stage output before enabling motion telemetry. No external telemetry transport is implemented now.
+
+Evidence gates: validate media; boot and observe native inputs/service; measure state and camera/aim; compare neutral replay then per-eye differences; integrate shared controls; compile and validate media-free Quest/PCVR artifacts. Document every blocked or untested gate in `validation.md`.

@@ -1,0 +1,11 @@
+--- a/scripts/src/osd/windows.lua
++++ b/scripts/src/osd/windows.lua
+@@ -25,6 +25,8 @@
+ 	if _OPTIONS["USE_SDL"] == "1" then
+ 		links {
+ 			"SDL2",
++			"setupapi",
++			"cfgmgr32",
+ 			"imm32",
+ 			"version",
+ 		}

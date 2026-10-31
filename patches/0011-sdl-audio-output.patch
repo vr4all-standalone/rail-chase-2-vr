@@ -1,0 +1,267 @@
+--- a/src/osd/modules/sound/sdl_sound.cpp
++++ b/src/osd/modules/sound/sdl_sound.cpp
+@@ -16,12 +16,18 @@
+ 
+ #include "modules/lib/osdobj_common.h"
+ #include "osdcore.h"
++#include "rchase2/audio_probe.h"
++#include "rchase2/adaptive_audio_bridge.h"
++#include "rchase2/shared_runtime.h"
++#include "modules/lib/osdlib.h"
+ 
+ // standard sdl header
+ #include <SDL2/SDL.h>
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <fstream>
+ #include <memory>
+ #include <map>
+@@ -66,12 +72,23 @@
+ 		uint32_t m_id;
+ 		SDL_AudioDeviceID m_sdl_id;
+ 		abuffer m_buffer;
++		rchase2::AudioStretchBridge m_stretch;
++		rchase2::AudioStretchProbe m_stretch_probe;
++		rchase2::SharedRuntime *m_runtime = nullptr;
++		bool m_audio_probe_enabled = false;
++		double m_audio_tick_seconds = 0;
++		rchase2::AudioProbe m_audio_probe;
+ 		stream_info(uint32_t id, uint8_t channels, uint32_t rate) : m_id(id), m_sdl_id(0), m_buffer(channels, rate) {}
++		~stream_info() { if(m_sdl_id) SDL_CloseAudioDevice(m_sdl_id); }
+ 	};
+ 
+ 	std::vector<device_info> m_devices;
+ 	uint32_t m_default_sink;
+ 	uint32_t m_stream_next_id;
++	std::FILE *m_audio_log = nullptr;
++
++	void write_audio_probe(uint32_t id, const char *event, double now, const rchase2::AudioProbeRecord &record);
++	void write_audio_stretch(uint32_t id, const char *event, double now, const rchase2::AudioStretchRecord &record);
+ 
+ 	std::map<uint32_t, std::unique_ptr<stream_info>> m_streams;
+ 
+@@ -89,6 +106,14 @@
+ 	if(SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+ 		osd_printf_error("Could not initialize SDL %s\n", SDL_GetError());
+ 		return -1;
++	}
++
++	// Opt-in diagnostics only. All file I/O runs on the producer/control thread.
++	const char *audio_log = std::getenv("RCHASE2_AUDIO_LOG");
++	if(audio_log && audio_log[0]) {
++		m_audio_log = std::fopen(audio_log, "a");
++		if(!m_audio_log)
++			osd_printf_warning("Audio: cannot open RCHASE2_AUDIO_LOG\n");
+ 	}
+ 
+ 	osd_printf_verbose("Audio: Start initialization\n");
+@@ -137,7 +162,13 @@
+ 
+ void sound_sdl::exit()
+ {
++	while(!m_streams.empty())
++		stream_close(m_streams.begin()->first);
+ 	SDL_QuitSubSystem(SDL_INIT_AUDIO);
++	if(m_audio_log) {
++		std::fclose(m_audio_log);
++		m_audio_log = nullptr;
++	}
+ 	m_devices.clear();
+ }
+ 
+@@ -215,9 +246,77 @@
+ 	stream->m_sdl_id = SDL_OpenAudioDevice(dev.m_def ? nullptr : dev.m_name.c_str(), 0, &dspec, &ospec, 0);
+ 	if(!stream->m_sdl_id)
+ 		return 0;
+-	SDL_PauseAudioDevice(stream->m_sdl_id, 0);
+-	uint32_t id = stream->m_id;
+-	m_streams[stream->m_id] = std::move(stream);
++	// Audio timestamps are needed even when diagnostic logging is disabled.
++	stream->m_audio_tick_seconds = 1.0 / double(SDL_GetPerformanceFrequency());
++	const double opened_at = SDL_GetPerformanceCounter() * stream->m_audio_tick_seconds;
++	if(rchase2::audio_stretch_requested(std::getenv("RCHASE2_VR"),
++		std::getenv("RCHASE2_AUDIO_STRETCH"),std::getenv("RCHASE2_AUDIO_REFERENCE"))) {
++		rchase2::AudioStretchOpen result = rchase2::AudioStretchOpen::Unsupported;
++		if(ospec.freq==48000 && ospec.channels==2 && ospec.format==AUDIO_S16SYS) {
++			result = rchase2::AudioStretchOpen::MissingExports;
++			try {
++				const char *library = rchase2::audio_stretch_library(
++					std::getenv("RCHASE2_AUDIO_LIBRARY"),
++#ifdef _WIN32
++					"rchase2_audio.dll");
++#else
++					"librchase2_audio.so");
++#endif
++				if(library && library[0]) {
++					// Independent audio module ownership survives XR host shutdown.
++					// SDL closes before destroy joins the worker and unloads it.
++					std::shared_ptr<osd::dynamic_module> module(osd::dynamic_module::open({library}));
++					rchase2::AudioStretchFunctions api;
++					api.create=module->bind<decltype(api.create)>("rchase2_audio_create");
++					api.push=module->bind<decltype(api.push)>("rchase2_audio_push");
++					api.read=module->bind<decltype(api.read)>("rchase2_audio_read");
++					api.pause=module->bind<decltype(api.pause)>("rchase2_audio_pause");
++					api.stats=module->bind<decltype(api.stats)>("rchase2_audio_stats");
++					api.destroy=module->bind<decltype(api.destroy)>("rchase2_audio_destroy");
++					result=stream->m_stretch.open(api,std::move(module),ospec.freq,ospec.channels);
++				}
++			} catch(...) {
++				stream->m_stretch.reset();
++				result=rchase2::AudioStretchOpen::CreateFailed;
++			}
++		}
++		const char *reason="unsupported_format";
++		switch(result) {
++		case rchase2::AudioStretchOpen::Ready: reason="ready";break;
++		case rchase2::AudioStretchOpen::Unsupported: break;
++		case rchase2::AudioStretchOpen::MissingExports: reason="missing_library_or_exports";break;
++		case rchase2::AudioStretchOpen::CreateFailed: reason="create_failed";break;
++		case rchase2::AudioStretchOpen::InvalidStats: reason="invalid_stats_abi_or_state";break;
++		}
++		if(stream->m_stretch.active()) {
++			// Force runtime initialization here, never from the SDL callback.
++			stream->m_runtime=&rchase2::shared_runtime();
++			Rchase2AudioStats initial{};
++			stream->m_stretch.snapshot(initial);
++			stream->m_stretch_probe.begin(opened_at,initial);
++			osd_printf_verbose("Audio: Rail Chase 2 adaptive output active, 48000Hz stereo S16\n");
++		} else
++			osd_printf_warning("Audio: Rail Chase 2 adaptive output unavailable (%s); using legacy SDL buffer\n",reason);
++		if(m_audio_log) {
++			std::fprintf(m_audio_log,"AUDIO_STRETCH_OPEN stream=%u wall_s=%.6f active=%u reason=%s\n",stream->m_id,opened_at,unsigned(stream->m_stretch.active()),reason);
++			std::fflush(m_audio_log);
++		}
++	}
++	if(m_audio_log) {
++		stream->m_audio_probe_enabled = !stream->m_stretch.active();
++		const double now = SDL_GetPerformanceCounter() * stream->m_audio_tick_seconds;
++		if(stream->m_audio_probe_enabled) stream->m_audio_probe.begin(now, stream->m_buffer.available());
++		std::fprintf(m_audio_log,
++			"AUDIO_OPEN stream=%u wall_s=%.6f requested_rate=%u rate=%d channels=%u samples=%u format=0x%04x driver=%s\n",
++			stream->m_id, now, rate, ospec.freq, unsigned(ospec.channels), unsigned(ospec.samples), unsigned(ospec.format),
++			SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "none");
++		std::fflush(m_audio_log);
++	}
++	const uint32_t id = stream->m_id;
++	const SDL_AudioDeviceID device = stream->m_sdl_id;
++	m_streams[id] = std::move(stream);
++	// Creation, ABI checks and all callback state are complete while paused.
++	SDL_PauseAudioDevice(device, 0);
+ 	return id;
+ }
+ 
+@@ -227,6 +326,19 @@
+ 	if(si == m_streams.end())
+ 		return;
+ 	SDL_CloseAudioDevice(si->second->m_sdl_id);
++	si->second->m_sdl_id = 0;
++	if(si->second->m_stretch.active()) {
++		const double now=SDL_GetPerformanceCounter()*si->second->m_audio_tick_seconds;
++		Rchase2AudioStats total{};
++		if(si->second->m_stretch.snapshot(total))
++			write_audio_stretch(id,"close",now,si->second->m_stretch_probe.take(total,now));
++		// No SDL callback can enter now. Destroy joins DSP before module unload.
++		si->second->m_stretch.reset();
++	}
++	if(si->second->m_audio_probe_enabled) {
++		const double now = SDL_GetPerformanceCounter() * si->second->m_audio_tick_seconds;
++		write_audio_probe(id, "close", now, si->second->m_audio_probe.take(now));
++	}
+ 	m_streams.erase(si);
+ }
+ 
+@@ -236,15 +348,90 @@
+ 	if(si == m_streams.end())
+ 		return;
+ 	stream_info *stream = si->second.get();
++	if(stream->m_stretch.active()) {
++		const double now=SDL_GetPerformanceCounter()*stream->m_audio_tick_seconds;
++		if(samples_this_frame>0) stream->m_stretch.push(buffer,uint32_t(samples_this_frame),now);
++		if(stream->m_stretch_probe.due(now)) {
++			Rchase2AudioStats total{};
++			if(stream->m_stretch.snapshot(total))
++				write_audio_stretch(id,"interval",now,stream->m_stretch_probe.take(total,now));
++		}
++		return;
++	}
++	rchase2::AudioProbeRecord record;
++	double now = 0;
++	bool report = false;
+ 	SDL_LockAudioDevice(stream->m_sdl_id);
++	const uint32_t queued = stream->m_audio_probe_enabled ? stream->m_buffer.available() : 0;
+ 	stream->m_buffer.push(buffer, samples_this_frame);
++	if(stream->m_audio_probe_enabled) {
++		now = SDL_GetPerformanceCounter() * stream->m_audio_tick_seconds;
++		stream->m_audio_probe.push(samples_this_frame, queued, stream->m_buffer.available(), now);
++		if(stream->m_audio_probe.due(now)) {
++			record = stream->m_audio_probe.take(now);
++			report = true;
++		}
++	}
+ 	SDL_UnlockAudioDevice(stream->m_sdl_id);
++	if(report)
++		write_audio_probe(id, "interval", now, record);
+ }
+ 
+ void sound_sdl::sink_callback(void *userdata, uint8_t *data, int len)
+ {
+ 	stream_info *stream = reinterpret_cast<stream_info *>(userdata);
+-	stream->m_buffer.get((int16_t *)data, len / 2 / stream->m_buffer.channels());
++	if(stream->m_stretch.active()) {
++		const uint32_t frames=uint32_t(len)/4;
++		const double now=SDL_GetPerformanceCounter()*stream->m_audio_tick_seconds;
++		const bool paused=stream->m_runtime->pause_requested.load(std::memory_order_relaxed) ||
++			!stream->m_runtime->host_ready.load(std::memory_order_relaxed) ||
++			stream->m_runtime->quit_requested.load(std::memory_order_relaxed);
++		stream->m_stretch.read(reinterpret_cast<int16_t *>(data),frames,now,paused);
++		if(len&3) std::fill(data+frames*4,data+len,uint8_t(0));
++		return;
++	}
++	const uint32_t frames = len / 2 / stream->m_buffer.channels();
++	if(stream->m_audio_probe_enabled) {
++		const double now = SDL_GetPerformanceCounter() * stream->m_audio_tick_seconds;
++		stream->m_audio_probe.callback(frames, stream->m_buffer.available(), now);
++	}
++	stream->m_buffer.get((int16_t *)data, frames);
++}
++
++void sound_sdl::write_audio_probe(uint32_t id, const char *event, double now, const rchase2::AudioProbeRecord &r)
++{
++	if(!m_audio_log)
++		return;
++	std::fprintf(m_audio_log,
++		"AUDIO_PROBE stream=%u wall_s=%.6f event=%s seconds=%.6f pushes=%llu pushed_frames=%llu callbacks=%llu requested_frames=%llu missing_frames=%llu underrun_callbacks=%llu dropped_frames=%llu queue_min=%u queue_max=%u queue_end=%u max_push_gap_ms=%.3f max_callback_gap_ms=%.3f\n",
++		id, now, event, r.seconds,
++		static_cast<unsigned long long>(r.pushes), static_cast<unsigned long long>(r.pushed_frames),
++		static_cast<unsigned long long>(r.callbacks), static_cast<unsigned long long>(r.requested_frames),
++		static_cast<unsigned long long>(r.missing_frames), static_cast<unsigned long long>(r.underrun_callbacks),
++		static_cast<unsigned long long>(r.dropped_frames), r.queue_min, r.queue_max, r.queue_end,
++		r.max_push_gap_seconds * 1000.0, r.max_callback_gap_seconds * 1000.0);
++	std::fflush(m_audio_log);
++}
++
++void sound_sdl::write_audio_stretch(uint32_t id, const char *event, double now, const rchase2::AudioStretchRecord &record)
++{
++	const auto &d=record.delta;const auto &t=record.total;
++	// Cumulative atomic counters yield interval deltas. Queues, tempo and ratio
++	// are current gauges; gap fields remain explicitly cumulative maxima.
++	char line[2048];
++	std::snprintf(line,sizeof(line),
++		"AUDIO_STRETCH stream=%u wall_s=%.6f event=%s seconds=%.6f state=%u native_frames=%llu produced_frames=%llu requested_frames=%llu delivered_frames=%llu missing_frames=%llu warmup_frames=%llu paused_frames=%llu paused_input_frames=%llu input_drops=%llu output_drops=%llu callbacks=%llu underrun_callbacks=%llu input_blocks=%llu output_blocks=%llu input_queue=%u output_queue=%u tempo=%.6f input_ratio=%.6f cumulative_max_input_gap_ms=%.3f cumulative_max_output_gap_ms=%.3f\n",
++		id,now,event,record.seconds,t.state,
++		static_cast<unsigned long long>(d.native_frames),static_cast<unsigned long long>(d.output_frames),
++		static_cast<unsigned long long>(d.requested_frames),static_cast<unsigned long long>(d.delivered_frames),
++		static_cast<unsigned long long>(d.missing_frames),static_cast<unsigned long long>(d.warmup_frames),
++		static_cast<unsigned long long>(d.paused_frames),static_cast<unsigned long long>(d.paused_input_frames),
++		static_cast<unsigned long long>(d.input_dropped_frames),static_cast<unsigned long long>(d.output_dropped_frames),
++		static_cast<unsigned long long>(d.callbacks),static_cast<unsigned long long>(d.underrun_callbacks),
++		static_cast<unsigned long long>(d.input_blocks),static_cast<unsigned long long>(d.output_blocks),
++		t.input_queue_frames,t.output_queue_frames,t.tempo,t.input_ratio,t.max_input_gap_ms,t.max_output_gap_ms);
++	if(m_audio_log) {std::fputs(line,m_audio_log);std::fflush(m_audio_log);}
++	else osd_printf_verbose("%s",line);
+ }
+ 
+ } // anonymous namespace

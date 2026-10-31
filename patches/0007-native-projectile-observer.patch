@@ -1,0 +1,11 @@
+--- a/src/mame/sega/model2.cpp
++++ b/src/mame/sega/model2.cpp
+@@ -2423,7 +2423,7 @@
+ 	if (!state)
+ 		return;
+ 
+-    rchase2::native_tick([&](uint32_t address){return m_maincpu->space(AS_PROGRAM).read_dword(address);});
++    rchase2::native_tick(*m_maincpu);
+ 	m_framenum = m_screen->frame_number();
+ 
+ 	// if 60 Hz mode or frame number is even, trigger geometrizer to start new frame

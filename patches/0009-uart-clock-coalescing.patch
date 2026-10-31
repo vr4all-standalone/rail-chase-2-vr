@@ -1,0 +1,326 @@
+--- a/src/devices/machine/i8251.h
++++ b/src/devices/machine/i8251.h
+@@ -44,6 +44,10 @@
+ 	void write_txc(int state);
+ 	void write_rxc(int state);
+ 	void write_syn(int state);
++
++	// Optional equivalent input source for the Model 2 fixed 500kHz TX/RX clock.
++	// Other configurations keep their existing external clock pins.
++	void set_batched_external_clock(uint32_t frequency) { assert(frequency == 500000); m_input_clock = frequency; }
+ 
+ 	int txrdy_r();
+ 	int rxrdy_r();
+@@ -69,6 +73,9 @@
+ 	// device_t implementation
+ 	virtual void device_start() override ATTR_COLD;
+ 	virtual void device_reset() override ATTR_COLD;
++	virtual void device_stop() override ATTR_COLD;
++	virtual void device_pre_save() override ATTR_COLD;
++	virtual void device_post_load() override ATTR_COLD;
+ 
+ 	void command_w(uint8_t data);
+ 	void mode_w(uint8_t data);
+@@ -93,6 +100,17 @@
+ 	};
+ 
+ private:
++	bool fixed_clock_eligible() const;
++	void fixed_clock_sync(bool inclusive = false);
++	void fixed_clock_advance(uint64_t edge, bool quiet);
++	void fixed_clock_schedule();
++	TIMER_CALLBACK_MEMBER(fixed_clock_tick);
++	uint32_t m_input_clock = 0;
++	emu_timer *m_input_timer = nullptr;
++	uint64_t m_input_edge = 0, m_input_pending = 0, m_input_armed = 0;
++	bool m_input_prepare = false, m_input_busy = false;
++	uint64_t m_input_events = 0, m_input_quiet_edges = 0, m_input_groups = 0, m_input_max_group = 0;
++
+ 	devcb_write_line m_txd_handler;
+ 	devcb_write_line m_dtr_handler;
+ 	devcb_write_line m_rts_handler;
+--- a/src/devices/machine/i8251.cpp
++++ b/src/devices/machine/i8251.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include "emu.h"
+ #include "i8251.h"
++#include "rchase2/uart_clock_policy.h"
+ 
+ #include <bit>
+ 
+@@ -144,6 +145,19 @@
+ 	save_item(NAME(m_ext_syn_set));
+ 	save_item(NAME(m_rxd_bits));
+ 	save_item(NAME(m_data_bits_count));
++	if(m_input_clock) {
++		save_item(NAME(m_input_edge));
++		save_item(NAME(m_input_pending));
++		save_item(NAME(m_input_armed));
++		save_item(NAME(m_input_prepare));
++		save_item(NAME(m_input_events));
++		save_item(NAME(m_input_quiet_edges));
++		save_item(NAME(m_input_groups));
++		save_item(NAME(m_input_max_group));
++		m_input_timer = timer_alloc(FUNC(i8251_device::fixed_clock_tick), this);
++		fixed_clock_schedule();
++		osd_printf_verbose("RCHASE2 UART coalescing enabled: %s, fixed 500000Hz, reference override available\n", tag());
++	}
+ }
+ 
+ 
+@@ -151,6 +165,103 @@
+ /*-------------------------------------------------
+     update_rx_ready
+ -------------------------------------------------*/
++
++bool i8251_device::fixed_clock_eligible() const
++{
++	return m_flags == I8251_NEXT_COMMAND && m_sync_byte_count == 0 &&
++		(m_mode_byte & 3) >= 2 && (m_br_factor == 16 || m_br_factor == 64) &&
++		m_txc_count >= 0 && m_txc_count < m_br_factor &&
++		(!BIT(m_command, 2) || (!is_receive_register_synchronized() && m_rxd == 1));
++}
++
++void i8251_device::fixed_clock_advance(uint64_t edge, bool quiet)
++{
++	const uint64_t count = edge > m_input_edge ? edge - m_input_edge : 0;
++	if(quiet && count) {
++		m_input_quiet_edges += count;
++		if(count > 1) ++m_input_groups;
++		m_input_max_group = std::max(m_input_max_group, count);
++	}
++	const bool was_busy = m_input_busy;
++	m_input_busy = true;
++	while(m_input_edge < edge) {
++		const int level = (++m_input_edge & 1) ? 1 : 0;
++		// Reuse every original state transition, including serial shift-register
++		// contents. Deferred edges are proven quiet by the eligibility/terminal
++		// bound; their callbacks cannot generate a pin or ready event.
++		write_txc(level);
++		write_rxc(level);
++	}
++	m_input_busy = was_busy;
++}
++
++void i8251_device::fixed_clock_sync(bool inclusive)
++{
++	if(!m_input_timer || m_input_busy) return;
++	const attotime now = machine().time();
++	const uint64_t whole = uint64_t(now.seconds()) * 1000000 + uint64_t(now.attoseconds() / 1000000000000LL);
++	const bool exact = !inclusive && (now.attoseconds() % 1000000000000LL == 0);
++	const uint64_t limit = rchase2::UartClockPolicy::flush_limit(whole, exact, m_input_pending);
++	fixed_clock_advance(limit, true);
++}
++
++void i8251_device::fixed_clock_schedule()
++{
++	if(!m_input_timer || m_input_busy) return;
++	const auto event = rchase2::UartClockPolicy::next(m_input_edge, m_txc_count,
++		m_br_factor, fixed_clock_eligible(), m_input_armed);
++	const attotime now = machine().time();
++	const uint64_t whole = uint64_t(now.seconds()) * 1000000 + uint64_t(now.attoseconds() / 1000000000000LL);
++	// Retaining an unchanged (or already due) timer is essential: cancelling
++	// and reinserting it would change ordering against simultaneous events.
++	if(rchase2::UartClockPolicy::keep_armed(m_input_pending, event.edge, whole)) return;
++	m_input_pending = event.edge;
++	m_input_prepare = event.prepare;
++	if(!event.prepare && event.edge != m_input_armed) m_input_armed = 0;
++	m_input_timer->adjust(attotime::from_usec(event.edge) - now);
++}
++
++TIMER_CALLBACK_MEMBER(i8251_device::fixed_clock_tick)
++{
++	++m_input_events;
++	const uint64_t edge = m_input_pending;
++	fixed_clock_advance(edge - 1, true);
++	if(m_input_prepare && fixed_clock_eligible()) {
++		// Only arm the terminal edge here. Do not consume this preparatory RX
++		// edge yet: an RXD transition at this exact timestamp must be applied
++		// first, just as with the original clock's late timer insertion.
++		m_input_armed = edge + 1;
++	} else {
++		fixed_clock_advance(edge, false);
++		m_input_armed = 0;
++	}
++	m_input_pending = 0;
++	m_input_prepare = false;
++	fixed_clock_schedule();
++}
++
++void i8251_device::device_pre_save()
++{
++	// At the save safe point all same-time pin callbacks have completed.
++	// Materialize quiet state, including a deferred preparatory rising edge.
++	fixed_clock_sync(true);
++}
++
++void i8251_device::device_post_load()
++{
++	m_input_busy = false;
++	// The saved timer retains its expiry and insertion index. Re-arming here
++	// would alter same-time ordering and could duplicate an edge after load.
++}
++
++void i8251_device::device_stop()
++{
++	if(m_input_timer)
++		osd_printf_verbose("RCHASE2 UART coalescing stats: %s timer_events=%llu virtual_edges=%llu quiet_edges=%llu groups=%llu max_group=%llu\n",
++			tag(), static_cast<unsigned long long>(m_input_events), static_cast<unsigned long long>(m_input_edge),
++			static_cast<unsigned long long>(m_input_quiet_edges), static_cast<unsigned long long>(m_input_groups),
++			static_cast<unsigned long long>(m_input_max_group));
++}
+ 
+ void i8251_device::update_rx_ready()
+ {
+@@ -502,6 +613,7 @@
+ 
+ void i8251_device::device_reset()
+ {
++	fixed_clock_sync();
+ 	LOG("I8251: Reset\n");
+ 
+ 	/* what is the default setup when the 8251 has been reset??? */
+@@ -536,6 +648,7 @@
+ 	update_rx_ready();
+ 	/* update tx ready pin output */
+ 	update_tx_ready();
++	fixed_clock_schedule();
+ }
+ 
+ 
+@@ -748,6 +861,7 @@
+ 
+ void i8251_device::control_w(uint8_t data)
+ {
++	fixed_clock_sync();
+ 	if (m_flags == I8251_NEXT_SYNC1)
+ 		sync1_w(data);
+ 	else if (m_flags == I8251_NEXT_SYNC2)
+@@ -756,6 +870,7 @@
+ 		mode_w(data);
+ 	else
+ 		command_w(data);
++	fixed_clock_schedule();
+ }
+ 
+ 
+@@ -766,6 +881,7 @@
+ 
+ uint8_t i8251_device::status_r()
+ {
++	fixed_clock_sync();
+ 	uint8_t status = (m_dsr << 7) | m_status;
+ 
+ 	LOG("status: %02x\n", status);
+@@ -784,6 +900,7 @@
+ 
+ void i8251_device::data_w(uint8_t data)
+ {
++	fixed_clock_sync();
+ 	m_tx_data = data;
+ 
+ 	LOG("data_w %02x\n", data);
+@@ -800,6 +917,7 @@
+ 	/* if transmitter is active, then tx empty will be signalled */
+ 	update_tx_ready();
+ 	update_tx_empty();
++	fixed_clock_schedule();
+ }
+ 
+ 
+@@ -838,6 +956,7 @@
+ 
+ uint8_t i8251_device::data_r()
+ {
++	fixed_clock_sync();
+ 	LOG("read data: %02x, STATUS=%02x\n",m_rx_data,m_status);
+ 	/* reading clears */
+ 	if (!machine().side_effects_disabled())
+@@ -869,13 +988,16 @@
+ 
+ void i8251_device::write_rxd(int state)
+ {
++	fixed_clock_sync();
+ 	m_rxd = state ? 1 : 0;
+ 	LOGBITS("8251: Presented a %d\n", m_rxd);
+ 	//device_serial_interface::rx_w(m_rxd);
++	fixed_clock_schedule();
+ }
+ 
+ void i8251_device::write_cts(int state)
+ {
++	fixed_clock_sync();
+ 	m_cts = state ? 1 : 0;
+ 
+ 	if (started())
+@@ -884,15 +1006,18 @@
+ 		update_tx_ready();
+ 		update_tx_empty();
+ 	}
++	fixed_clock_schedule();
+ }
+ 
+ void i8251_device::write_dsr(int state)
+ {
++	fixed_clock_sync();
+ 	m_dsr = !state;
+ }
+ 
+ void i8251_device::write_rxc(int state)
+ {
++	fixed_clock_sync();
+ 	state = state ? 1 : 0;
+ 
+ 	if (!m_rxc && state)
+@@ -910,6 +1035,7 @@
+ 
+ void i8251_device::write_txc(int state)
+ {
++	fixed_clock_sync();
+ 	state = state ? 1 : 0;
+ 
+ 	if (m_txc != state)
+@@ -924,6 +1050,7 @@
+ // forcibly kill hunt mode
+ void i8251_device::write_syn(int state)
+ {
++	fixed_clock_sync();
+ 	if (m_syndet_pin && state)    // must be set as input
+ 	{
+ 		m_ext_syn_set = true;
+@@ -934,11 +1061,13 @@
+ 
+ int i8251_device::txrdy_r()
+ {
++	fixed_clock_sync();
+ 	return is_tx_enabled() && (m_status & I8251_STATUS_TX_READY) != 0;
+ }
+ 
+ int i8251_device::rxrdy_r()
+ {
++	fixed_clock_sync();
+ 	// masked?
+ 	if (!BIT(m_command, 2))
+ 		return 0;
+--- a/src/mame/sega/model2.cpp
++++ b/src/mame/sega/model2.cpp
+@@ -2544,9 +2544,15 @@
+ 	m_uart->rxrdy_handler().set(FUNC(model2_state::sound_ready_w));
+ 	m_uart->txrdy_handler().set(FUNC(model2_state::sound_ready_w));
+ 
+-	clock_device &uart_clock(CLOCK(config, "uart_clock", 500000)); // 16 times 31.25kHz (standard Sega/MIDI sound data rate)
+-	uart_clock.signal_handler().set(m_uart, FUNC(i8251_device::write_txc));
+-	uart_clock.signal_handler().append(m_uart, FUNC(i8251_device::write_rxc));
++	const char *coalesce = std::getenv("RCHASE2_UART_COALESCE");
++	if(std::getenv("RCHASE2_VR") && coalesce && std::string_view(coalesce) == "1" &&
++		!std::getenv("RCHASE2_UART_REFERENCE"))
++		m_uart->set_batched_external_clock(500000);
++	else {
++		clock_device &uart_clock(CLOCK(config, "uart_clock", 500000)); // 16 times 31.25kHz (standard Sega/MIDI sound data rate)
++		uart_clock.signal_handler().set(m_uart, FUNC(i8251_device::write_txc));
++		uart_clock.signal_handler().append(m_uart, FUNC(i8251_device::write_rxc));
++	}
+ }
+ 
+ /* original Model 2 */

@@ -1,0 +1,117 @@
+--- a/src/emu/schedule.cpp
++++ b/src/emu/schedule.cpp
+@@ -10,6 +10,30 @@
+ 
+ #include "emu.h"
+ #include "debugger.h"
++#include "rchase2/uart_clock_policy.h"
++#include <cstdlib>
++
++namespace {
++bool rchase2_uart_grid_enabled()
++{
++	static const bool enabled = rchase2::UartClockPolicy::enabled(
++		std::getenv("RCHASE2_VR"), std::getenv("RCHASE2_UART_COALESCE"),
++		std::getenv("RCHASE2_UART_REFERENCE"));
++	return enabled;
++}
++
++attotime rchase2_uart_grid_after(const attotime &base)
++{
++	const auto grid = rchase2::UartClockPolicy::next_global_grid(base.seconds(), base.attoseconds());
++	return attotime(grid.seconds, grid.attoseconds);
++}
++
++bool rchase2_before_virtual_uart(const attotime &expiry, const attotime &base)
++{
++	return rchase2::UartClockPolicy::precedes_global_grid(
++		expiry.seconds(), expiry.attoseconds(), base.seconds(), base.attoseconds());
++}
++} // anonymous namespace
+ 
+ //**************************************************************************
+ //  DEBUGGING
+@@ -98,7 +122,10 @@
+ 
+ 	// insert into the list
+ 	m_scheduler->timer_list_insert(*this);
+-	if (this == m_scheduler->first_timer())
++	// A quiet virtual UART edge still heads the legacy queue. A newly
++	// inserted timer tied with that edge follows it and must not abort a CPU.
++	if (this == m_scheduler->first_timer() &&
++		(!rchase2_uart_grid_enabled() || rchase2_before_virtual_uart(m_expire, m_scheduler->m_basetime)))
+ 		m_scheduler->abort_timeslice();
+ 
+ 	return *this;
+@@ -160,7 +187,10 @@
+ 	m_scheduler->timer_list_insert(*this);
+ 
+ 	// if this was inserted as the head, abort the current timeslice and resync
+-	if (this == m_scheduler->first_timer())
++	// A quiet virtual UART edge still heads the legacy queue. A newly
++	// inserted timer tied with that edge follows it and must not abort a CPU.
++	if (this == m_scheduler->first_timer() &&
++		(!rchase2_uart_grid_enabled() || rchase2_before_virtual_uart(m_expire, m_scheduler->m_basetime)))
+ 		m_scheduler->abort_timeslice();
+ }
+ 
+@@ -392,6 +422,8 @@
+ 
+ void device_scheduler::timeslice()
+ {
++	const bool uart_grid = rchase2_uart_grid_enabled();
++	const attotime uart_boundary = uart_grid ? rchase2_uart_grid_after(m_basetime) : attotime::never;
+ 	bool call_debugger = ((machine().debug_flags & DEBUG_FLAG_ENABLED) != 0);
+ 
+ 	// build the execution list if we don't have one yet
+@@ -407,6 +439,10 @@
+ 	{
+ 		// by default, assume our target is the end of the next quantum
+ 		attotime target(m_basetime + attotime(0, m_quantum_list.first()->m_actual));
++		// Keep the original absolute 1us CPU grid even when a real +80ns
++		// timer splits a slice. A relative maximum quantum would drift.
++		if (uart_grid && uart_boundary < target)
++			target = uart_boundary;
+ 
+ 		// however, if the next timer is going to fire before then, override
+ 		if (m_timer_list->m_expire < target)
+@@ -499,6 +535,11 @@
+ 
+ 		// update the base time
+ 		m_basetime = target;
++		// Return through execute_timers at each original clock boundary.
++		// The next call retains all outer-entry housekeeping and machine-loop
++		// save/load cadence, including quantum expiry and debugger refresh.
++		if (uart_grid && m_basetime == uart_boundary)
++			break;
+ 	}
+ 
+ 	// execute timers
+--- a/src/emu/schedule.h
++++ b/src/emu/schedule.h
+@@ -108,6 +108,7 @@
+ 	// getters
+ 	running_machine &machine() const noexcept { return m_machine; }
+ 	attotime time() const noexcept;
++	attotime base_time() const noexcept { return m_basetime; }
+ 	emu_timer *first_timer() const noexcept { return m_timer_list; }
+ 	device_execute_interface *currently_executing() const noexcept { return m_executing_device; }
+ 	bool can_save() const;
+--- a/src/devices/machine/i8251.cpp
++++ b/src/devices/machine/i8251.cpp
+@@ -201,7 +201,14 @@
+ 	const attotime now = machine().time();
+ 	const uint64_t whole = uint64_t(now.seconds()) * 1000000 + uint64_t(now.attoseconds() / 1000000000000LL);
+ 	const bool exact = !inclusive && (now.attoseconds() % 1000000000000LL == 0);
+-	const uint64_t limit = rchase2::UartClockPolicy::flush_limit(whole, exact, m_input_pending);
++	const auto &scheduler = machine().scheduler();
++	const attotime base = scheduler.base_time();
++	const uint64_t completed = uint64_t(base.seconds()) * 1000000 + uint64_t(base.attoseconds() / 1000000000000LL);
++	// A CPU resuming after timers at31us must see the completed rising31
++	// edge; a CPU reaching future31 during the slice from30 must not. This
++	// also handles CPU local times slightly behind the completed global base.
++	const uint64_t limit = rchase2::UartClockPolicy::cpu_flush_limit(
++		whole, exact, m_input_pending, completed, scheduler.currently_executing() != nullptr);
+ 	fixed_clock_advance(limit, true);
+ }
+ 
