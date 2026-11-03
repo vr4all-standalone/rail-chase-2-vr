@@ -42,13 +42,10 @@ class Labels {
         glm::vec3 x,y,z;facing(at,eye,{1,0,0},x,y,z);
         return {glm::vec4(x,0),glm::vec4(y,0),glm::vec4(z,0),glm::vec4(at,1)};
     }
-    static void pictures(Layout& l,int hand,int startPlayer,int gunPlayer) {
-        const char* pump[2][2]={{"Y - Service next","Y - Service next"},{"B - Service next","B - Service next"}};
-        const char* start[2][2]={{"X - P1 Start","X - P2 Start"},{"A - P1 Start","A - P2 Start"}};
-        const char* shoot[]={"Trigger - P1 Hold fire","Trigger - P2 Hold fire"};
-        const char* words[]={pump[hand][gunPlayer],start[hand][startPlayer],"Menu",shoot[gunPlayer],hand==0?"Stick - Recenter":"Stick - Laser"};
+    static void pictures(Layout& l,int hand) {
+        const char* words[]={hand==0?"Y - ":"B - ",hand==0?"X - Start":"A - Start","Menu","Trigger - Fire",hand==0?"Stick - Recenter":"Stick - Laser / Crosshair"};
         for(int b=0;b<5;b++) {
-            if(hand==1&&b==Menu)continue;
+            if(b==Pump||(hand==1&&b==Menu))continue;
             int w{},h{};auto& p=l.pictures[b];p.texture=vr::xr::textTexture(words[b],40,glm::vec3(.96f),w,h);
             p.hy=Height*.5f;p.hx=h?p.hy*w/h:0;
         }
@@ -75,15 +72,16 @@ class Labels {
         for(int b=0;b<rows;b++)place(b,column,ys[b],side,room(column,ys[b]));
         const float stickX=x(Stick),stickY=std::max(y(Stick),ys[0])+StickRise;
         place(Stick,stickX,stickY,0,room(stickX,stickY-Height*.5f));
-        place(Trigger,stickX,stickY+Pitch,0,glm::vec3(0),true);
+        const float inside=x(Trigger)-side*Gap;
+        place(Trigger,inside,y(Trigger),-side,room(inside,y(Trigger)));
     }
 public:
     // model is exactly the model matrix used to draw this bundled controller.
     // Both eyes share the layout until the controller or viewpoint moves.
-    void draw(const glm::mat4& vp,int hand,const glm::mat4& model,int startPlayer,int gunPlayer) {
-        auto& l=layouts_[hand];const auto eye=eyeOf(vp);const int key=startPlayer*2+gunPlayer;
+    void draw(const glm::mat4& vp,int hand,const glm::mat4& model) {
+        auto& l=layouts_[hand];const auto eye=eyeOf(vp);const int key=hand;
         const bool wordsChanged=l.key!=key;
-        if(wordsChanged)pictures(l,hand,startPlayer,gunPlayer);
+        if(wordsChanged)pictures(l,hand);
         if(wordsChanged||l.model!=model||l.count==0||glm::length(eye-l.eye)>.1f){l.model=model;l.eye=eye;l.key=key;layOut(l,hand,model,eye);}
         const glm::vec4 colour(.92f,.92f,.92f,.85f);
         for(size_t i=0;i<l.count;i++) {

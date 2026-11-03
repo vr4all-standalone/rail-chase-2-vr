@@ -18,13 +18,13 @@ static void either_hand_starts_p1(int layout,int first) {
     assert(input.cabinet.coins==0&&input.cabinet.starts==1); // Native P1 Start follows credit.
     native.joined_mask=1;
     input=policy.update(.18,hands,native,settings,true,false);
-    assert(input.cabinet.coins==0&&input.cabinet.starts==0&&!input.cabinet.trigger[0]);
+    assert(input.hand[0]==first&&input.cabinet.coins==0&&input.cabinet.starts==0&&!input.cabinet.trigger[0]);
     input=policy.update(.30,hands,native,settings,true,false);
     assert(input.cabinet.coins==0&&input.cabinet.starts==0&&!input.cabinet.trigger[0]);
     hands=neutral();policy.update(.31,hands,native,settings,true,false);
     hands[first].trigger=true;input=policy.update(.32,hands,native,settings,true,false);
     assert(input.hand[0]==first&&input.cabinet.trigger[0]); // Solo P1 still uses either hand.
-    const int second=1-layout;
+    const int second=1-first;
     hands[0].trigger=hands[1].trigger=true;hands[second].start=true;
     input=policy.update(.33,hands,native,settings,true,false);
     assert(input.cabinet.coins==2&&input.cabinet.starts==0);

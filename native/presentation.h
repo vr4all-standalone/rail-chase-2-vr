@@ -12,6 +12,7 @@ struct PresentationInput {
     std::array<std::optional<glm::vec3>,2> grips{};
     glm::mat4 gun_pose(int hand) const{return rchase2::gun_pose(poses[hand],grips[hand]);}
     glm::mat4 head{1};glm::vec2 stick{};
+    std::array<glm::vec2,2> sticks{};
     bool toggle{};
     bool focused{true};
 };

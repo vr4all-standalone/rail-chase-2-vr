@@ -1,3 +1,4 @@
+#include "menu_pointer.h"
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "presentation.h"
 #include "settings_io.h"
@@ -23,8 +24,8 @@
 #include <sstream>
 namespace rchase2 {
 namespace {
-const char* labels[]={"Resume","Recenter","Gun","Gun angle","Fire mode","Two players","Laser","Reticle","Reticle min size","Reticle max size","Reticle shrink distance","Haptics","World size","Panel distance","HUD size","Gun size","Wider view","View width","Cart bottom","How to play","Open Service Menu","Reset to defaults","Quit"};
-constexpr int row_count=std::size(labels);
+const char* labels[]={"Resume","Recenter","Gun model","Gun angle","Fire mode","Two players","Laser","Crosshair","Crosshair min size","Crosshair max size","Crosshair shrink distance","Haptics","World size","Panel distance","HUD size","Gun size","Wider view","View width","Cart bottom","How to play","Open Service Menu","Reset to defaults","Quit"};
+
 std::string number(float n,int digits=2){std::ostringstream o;o<<std::fixed<<std::setprecision(digits)<<n;return o.str();}
 void save(const Settings& s) {const char* name=std::getenv("RCHASE2_SETTINGS");std::ofstream out(name?name:"rchase2-settings.ini");if(out)write_settings(out,s);}
 struct Model {
@@ -73,52 +74,111 @@ struct Model {
 struct Presentation::Impl {
     ControllerHelpPolicy startup_help;
     controller_help::Labels controller_labels;
-    bool opened{},help{},fresh{},recenter{},quit_armed{},custom_failed{},service_mode{},service_seen_native{},service_guns{},native_calibration{},calibration_busy{};double quit_at{};int selected{},loaded_gun{-1};
+    bool opened{},help{},fresh{},recenter{},custom_failed{},service_mode{},service_seen_native{},service_guns{},native_calibration{},calibration_busy{};int selected{},loaded_gun{-1};
+    MenuPointer pointer;
+    enum Page {Gun,World,System,Game,GunAdvanced,WorldAdvanced};
+    Page page{Gun};
+    int confirmation{-1};
     SharedRuntime* runtime{};
-    std::array<ButtonLatch,2> trigger_latch,start_latch;ButtonLatch toggle_latch;bool stick_wait{true};glm::vec2 stick_was{};double repeat_at{};
-    int hovered[2]{-1,-1};
+    std::array<ButtonLatch,2> start_latch;ButtonLatch toggle_latch;bool stick_wait{true};glm::vec2 stick_was{};double repeat_at{};
+    int hovered{-1};
     glm::mat4 panel_model{1};PresentationInput input;CabinetInput cabinet;std::array<double,2> shot_time{-100,-100};
     Model gun;std::array<Model,2> controllers;bool controllers_loaded{};GLuint model_program{};GunEffects gun_effects;
-    vr::xr::RowsPanel rows(const Settings& s) const {
-        vr::xr::RowsPanel p;p.title="VR4ALL / Rail Chase 2";p.footer="Either trigger chooses  /  Menu returns";
-        if(selected==7)p.footer="Original artwork, a hollow X, or no gameplay reticle";
-        if(selected==8)p.footer="Far-distance minimum for the selected reticle artwork";
-        if(selected==9)p.footer="Close-up maximum for the selected reticle artwork";
-        if(selected==10)p.footer="Larger distances make reticles shrink more slowly";
-        if(selected==14)p.footer="Known 2D HUD only in large view; small view keeps 100%";
+    enum {Advanced=23,Cancel,Confirm};
+    std::vector<int> rows() const {
+        if(confirmation>=0)return {Cancel,Confirm};
+        switch(page){
+        case Gun:return {2,3,6,7,11,Advanced};
+        case GunAdvanced:return {15,8,9,10};
+        case World:return {16,Advanced};
+        case WorldAdvanced:return {12,13,14,17,18};
+        case System:return {5,20,19,21,22};
+        case Game:return {20};
+        }
+        return {};
+    }
+    bool advanced() const {return page==GunAdvanced||page==WorldAdvanced;}
+    void show(Page next) {page=next;selected=0;hovered=-1;confirmation=-1;}
+    void close() {opened=false;help=false;pointer.suspend();}
+    vr::xr::SettingsPanel panel(const Settings& s) const {
+        vr::xr::SettingsPanel p;
+        p.game="Rail Chase 2";
+        const char* titles[]={"Gun","World","System","In-game","Advanced gun settings","Advanced world settings"};
+        p.title=titles[page];
+        p.activeTab=page==GunAdvanced?Gun:page==WorldAdvanced?World:page;
+        p.back=advanced();
+        if(selected<0){p.selectedTab=advanced()?-1:p.activeTab;p.backSelected=advanced();}
+        p.dialog=confirmation>=0;
+        p.footer=page==Game?"Original game options are in Service Menu":"Aim + trigger to select  /  Menu returns";
+        if(p.dialog)p.title=confirmation==21?"Reset VR settings?":"Quit to the launcher?";
         const char* haptics[]={"Off","Light","Medium","Strong"};
         const std::string gun=s.gun==0?"Arcade":s.gun==1?"Zapper":custom_failed?"Custom (Arcade fallback)":"Custom";
         const bool custom=s.reticle_mode==ReticleMode::Custom;
-        std::string values[]={"","",gun,number(s.gun_angle,0),"Hold trigger",s.p1_hand==0?"P1 left / P2 right":"P1 right / P2 left",s.laser?"On":"Off",reticle_mode_label(s.reticle_mode),number((custom?s.reticle_custom_min_size:s.reticle_min_size)*100,0)+"%",number((custom?s.reticle_custom_max_size:s.reticle_max_size)*100,0)+"%",number(s.reticle_shrink_distance,1)+" m",haptics[haptic_level(s.haptics)],number(s.world_scale,3),number(s.panel_distance)+" m",number(s.hud_size*100,0)+"%",number(s.gun_scale),s.wider_view?"On":"Off",number(s.view_fov,0)+" deg",s.cart_bottom?"On":"Off",help?"Shown":"", service_mode?(service_guns?"Aim guns":"Native menu"):"","",quit_armed?"Choose again":""};
-        static_assert(std::size(values)==std::size(labels));
-        for(int i=0;i<row_count;i++)p.rows.push_back({i==20&&service_mode?"Service controls":labels[i],values[i],selected==i,(i==8||i==9)&&s.reticle_mode==ReticleMode::None,i==2||i==3||((i>=7&&i<=18)&&!(s.reticle_mode==ReticleMode::None&&(i==8||i==9)))||(i==20&&native_calibration)});return p;
+        std::string values[]={"","",gun,number(s.gun_angle,0),"Hold trigger",s.p1_hand==0?"P1 left / P2 right":"P1 right / P2 left",s.laser?"On":"Off",reticle_mode_label(s.reticle_mode),number((custom?s.reticle_custom_min_size:s.reticle_min_size)*100,0)+"%",number((custom?s.reticle_custom_max_size:s.reticle_max_size)*100,0)+"%",number(s.reticle_shrink_distance,1)+" m",haptics[haptic_level(s.haptics)],number(s.world_scale,3),number(s.panel_distance)+" m",number(s.hud_size*100,0)+"%",number(s.gun_scale),s.wider_view?"On":"Off",number(s.view_fov,0)+" deg",s.cart_bottom?"On":"Off",help?"Shown":"", service_mode?(service_guns?"Aim guns":"Native menu"):"","",""};
+        for(int row:rows()){
+            vr::xr::SettingsRow item;
+            item.selected=int(p.rows.size())==selected;
+            if(row>=Advanced){
+                item.label=row==Advanced?"Advanced":row==Cancel?"Cancel":"Confirm";
+                item.action=true;
+            }else{
+                item.label=row==20&&service_mode?"Service controls":labels[row];
+                item.value=values[row];
+                item.stepper=row==3||(row>=8&&row<=10)||(row>=12&&row<=16);
+                item.action=row==20||row==19||row==21||row==22;
+                item.stepper=item.stepper||row==17;
+                item.dim=(row==8||row==9)&&s.reticle_mode==ReticleMode::None;
+                switch(row){
+                case 2:item.choices={"Arcade","Zapper","Custom"};item.choice=s.gun;break;
+                case 5:item.choices={"P1 left / P2 right","P1 right / P2 left"};item.choice=s.p1_hand;break;
+                case 6:item.choices={"Off","Normal","5x","10x"};item.choice=s.laser?s.laser_width:0;break;
+                case 7:item.choices={"In-game","Custom","None"};item.choice=int(s.reticle_mode);break;
+                case 18:item.choices={"Off","On"};item.choice=s.cart_bottom;break;
+                case 16:item.choices={"Off","On"};item.choice=s.wider_view;break;
+                case 11:item.choices={haptics[0],haptics[1],haptics[2],haptics[3]};item.choice=haptic_level(s.haptics);break;
+                }
+                if(!item.choices.empty())item.value.clear();
+            }
+            p.rows.push_back(std::move(item));
+        }
+        return p;
     }
-    void choose(int row,int direction,Settings& s,SharedRuntime& runtime,double now) {
-        if(row!=22)quit_armed=false;
+    void choose(int row,int direction,Settings& s,SharedRuntime& runtime,int choice=-1) {
+        if(row==Advanced){show(page==Gun?GunAdvanced:WorldAdvanced);return;}
+        if(row==Cancel){confirmation=-1;selected=0;return;}
+        if(row==21||row==22){confirmation=row;selected=0;return;}
+        if(row==Confirm){
+            if(confirmation==22)runtime.quit_requested=true;
+            if(confirmation==21){s=Settings{};runtime.release_inputs();help=false;save(s);}
+            confirmation=-1;selected=0;return;
+        }
         switch(row) {
         case 0:opened=false;help=false;break;
         case 1:recenter=true;opened=false;break;
-        case 2:s.gun=(s.gun+direction+3)%3;break;
+        case 2:s.gun=choice<0?(s.gun+direction+3)%3:choice;break;
         case 3:s.gun_angle=std::clamp(s.gun_angle+direction,-30.f,30.f);break;
         case 4:break;
-        case 5:s.p1_hand=1-s.p1_hand;break;
-        case 6:s.laser=!s.laser;break;
-        case 7:s.reticle_mode=next_reticle_mode(s.reticle_mode,direction);break;
+        case 5:s.p1_hand=choice<0?1-s.p1_hand:choice;break;
+        case 6:{
+            const int value=choice<0?std::clamp((s.laser?s.laser_width:0)+direction,0,3):choice;
+            s.laser=value!=0;
+            if(value)s.laser_width=value;
+            break;
+        }
+        case 7:s.reticle_mode=choice<0?next_reticle_mode(s.reticle_mode,direction):ReticleMode(choice);break;
         case 8:if(s.reticle_mode==ReticleMode::None)break;{auto& value=s.reticle_mode==ReticleMode::Custom?s.reticle_custom_min_size:s.reticle_min_size;value=std::clamp(std::round(value*100)+direction,5.f,100.f)/100;break;}
         case 9:if(s.reticle_mode==ReticleMode::None)break;{auto& value=s.reticle_mode==ReticleMode::Custom?s.reticle_custom_max_size:s.reticle_max_size;value=std::clamp(std::round(value*100)+direction*5.f,25.f,300.f)/100;break;}
         case 10:s.reticle_shrink_distance=std::clamp(std::round(s.reticle_shrink_distance*10)+direction,2.f,200.f)/10;break;
-        case 11:s.haptics=HapticLevels[std::clamp(haptic_level(s.haptics)+direction,0,3)];break;
+        case 11:s.haptics=HapticLevels[choice<0?std::clamp(haptic_level(s.haptics)+direction,0,3):choice];break;
         case 12:s.world_scale=std::clamp(s.world_scale+direction*.005f,.01f,1.f);break;
         case 13:s.panel_distance=std::clamp(s.panel_distance+direction*.1f,.5f,10.f);break;
         case 14:s.hud_size=std::clamp(std::round(s.hud_size*100)+direction*5.f,50.f,200.f)/100;break;
         case 15:s.gun_scale=std::clamp(s.gun_scale+direction*.05f,.4f,1.6f);break;
-        case 16:s.wider_view=!s.wider_view;break;
+        case 16:s.wider_view=choice<0?!s.wider_view:choice!=0;break;
         case 17:s.view_fov=std::clamp(s.view_fov+direction*5.f,35.f,95.f);break;
-        case 18:s.cart_bottom=!s.cart_bottom;break;
+        case 18:s.cart_bottom=choice<0?!s.cart_bottom:choice!=0;break;
         case 19:help=!help;break;
         case 20:if(!service_mode){runtime.service_requested=true;service_seen_native=false;service_guns=false;}else if(native_calibration)service_guns=!service_guns;runtime.release_inputs();service_mode=true;opened=false;help=false;break;
-        case 21:s=Settings{};runtime.release_inputs();help=false;fresh=true;break;
-        case 22:if(quit_armed&&now-quit_at<3)runtime.quit_requested=true;else {quit_armed=true;quit_at=now;}break;
         }
         save(s);
     }
@@ -150,7 +210,7 @@ void Presentation::prepare(const Settings& s,SharedRuntime* runtime) {
         }
     }
 }
-void Presentation::suspend(){auto& p=*impl_;for(auto& latch:p.trigger_latch)latch.suspend();for(auto& latch:p.start_latch)latch.suspend();p.toggle_latch.suspend();p.stick_wait=true;p.input.hands={};p.input.aim_targets={};p.gun_effects.clear();p.shot_time={-100,-100};}
+void Presentation::suspend(){auto& p=*impl_;p.pointer.suspend();for(auto& latch:p.start_latch)latch.suspend();p.toggle_latch.suspend();p.stick_wait=true;p.input.hands={};p.input.aim_targets={};p.gun_effects.clear();p.shot_time={-100,-100};}
 bool Presentation::recenter_requested(){return std::exchange(impl_->recenter,false);}
 glm::vec3 Presentation::muzzle(const glm::mat4& aim,const Settings& s,int hand) const{return glm::vec3(gun_model_transform(aim,s.gun_scale,hand,impl_->gun.placement)*glm::vec4(impl_->gun.muzzle,1));}
 void Presentation::feedback(const CabinetInput& in,double now){
@@ -195,33 +255,68 @@ void Presentation::update(const PresentationInput& input,Settings& s,SharedRunti
     }
     if(!input.focused)suspend();
     else if(!input.hands[0].tracked&&!input.hands[1].tracked){p.gun_effects.clear();p.shot_time={-100,-100};}
-    bool trigger_edge[2],start_edge[2];
-    for(int h=0;h<2;h++){trigger_edge[h]=p.trigger_latch[h].edge(input.hands[h].trigger,input.focused&&input.hands[h].tracked);start_edge[h]=p.start_latch[h].edge(input.hands[h].start,input.focused);}
+    bool start_edge[2];
+    for(int h=0;h<2;h++)start_edge[h]=p.start_latch[h].edge(input.hands[h].start,input.focused);
     if(p.toggle_latch.edge(input.toggle,input.focused)) {
-        p.opened=!p.opened;p.fresh=true;p.help=false;p.quit_armed=false;p.selected=0;
+        p.opened=!p.opened;p.fresh=true;p.help=false;p.show(Impl::Gun);p.stick_wait=true;runtime.release_inputs();
         auto f=glm::vec3(input.head*glm::vec4(0,0,-1,0));auto at=glm::vec3(input.head[3]);
         p.panel_model=glm::translate(glm::mat4(1),at)*glm::rotate(glm::mat4(1),std::atan2(-f.x,-f.z),glm::vec3(0,1,0))*glm::translate(glm::mat4(1),glm::vec3(0,-.1,-1.2));
     }
-    if(p.opened&&input.focused) {
-        if(now-p.quit_at>3)p.quit_armed=false;
-        auto rows=p.rows(s);
-        for(int h=0;h<2;h++)if(input.hands[h].tracked) {
-            auto aim=p.help?input.poses[h]:pitched_gun_pose(input.gun_pose(h),s.gun_angle);
-            auto o=p.help?glm::vec3(aim[3]):muzzle(aim,s,h),d=glm::vec3(aim*glm::vec4(0,0,-1,0));float u{};
-            int row=vr::xr::rowAt(p.panel_model,rows,o,d,&u);
-            if(row>=0) {if(row!=p.hovered[h])p.selected=row;if(trigger_edge[h]&&!p.fresh)p.choose(row,u<.5f?-1:1,s,runtime,now);}
-            p.hovered[h]=row;
+    const auto pointer=p.pointer.update(p.opened,input.focused,{input.hands[0].tracked,input.hands[1].tracked},
+        {input.hands[0].trigger,input.hands[1].trigger},s.p1_hand);
+    const int hand=pointer.owner;
+    if(!p.opened||!input.focused||hand<0)return;
+    if(pointer.changed){p.hovered=-1;p.stick_wait=true;p.stick_was={};}
+    const auto panel=p.panel(s);
+    const auto rows=p.rows();
+    const auto aim=p.help?input.poses[hand]:pitched_gun_pose(input.gun_pose(hand),s.gun_angle);
+    const auto origin=p.help?glm::vec3(aim[3]):muzzle(aim,s,hand);
+    const auto direction=glm::vec3(aim*glm::vec4(0,0,-1,0));
+    const auto hit=vr::xr::settingsHit(p.panel_model,panel,origin,direction);
+    using Kind=vr::xr::SettingsHit::Kind;
+    const int hover=hit.kind==Kind::Row?hit.index:-1;
+    if(hover>=0&&hover!=p.hovered)p.selected=hover;
+    p.hovered=hover;
+    const bool was_fresh=p.fresh;
+    const bool activate=pointer.activate&&!was_fresh;
+    p.fresh=false;
+    if(activate){
+        switch(hit.kind){
+        case Kind::Close:p.close();runtime.release_inputs();return;
+        case Kind::Back:p.show(p.page==Impl::GunAdvanced?Impl::Gun:Impl::World);return;
+        case Kind::Tab:p.show(Impl::Page(hit.index));return;
+        case Kind::Row:p.choose(rows[hit.index],hit.direction?hit.direction:1,s,runtime,hit.choice);return;
+        default:break;
         }
-        if(glm::length(input.stick)<.25f)p.stick_wait=false;
-        glm::vec2 stick=p.stick_wait?glm::vec2(0):input.stick;
-        bool vertical=std::abs(stick.y)>.65f,horizontal=std::abs(stick.x)>.65f;
-        bool step=now>=p.repeat_at;
-        if(vertical&&(std::abs(p.stick_was.y)<.65f||step)){p.selected=(p.selected+(stick.y>0?-1:1)+row_count)%row_count;p.repeat_at=now+(std::abs(p.stick_was.y)<.65f?.4:.15);p.quit_armed=false;}
-        if(horizontal&&p.selected!=21&&(std::abs(p.stick_was.x)<.65f||step)){p.choose(p.selected,stick.x>0?1:-1,s,runtime,now);p.repeat_at=now+.15;}
-        for(int h=0;h<2;h++)if(start_edge[h]&&!p.fresh)p.choose(p.selected,1,s,runtime,now);
-        p.fresh=false;
     }
-    p.stick_was=input.stick;
+    const auto raw=input.sticks[hand];
+    if(glm::length(raw)<.25f)p.stick_wait=false;
+    const auto stick=p.stick_wait?glm::vec2(0):raw;
+    const bool vertical=std::abs(stick.y)>.65f,horizontal=std::abs(stick.x)>.65f;
+    const bool repeat=now>=p.repeat_at;
+    const bool start=start_edge[hand]&&!pointer.changed&&!was_fresh;
+    if(vertical&&(std::abs(p.stick_was.y)<.65f||repeat)){
+        const int count=int(rows.size());
+        if(p.confirmation>=0)p.selected=(p.selected+(stick.y>0?-1:1)+count)%count;
+        else p.selected=std::clamp(p.selected+(stick.y>0?-1:1),-1,count-1);
+        p.repeat_at=now+.25;
+    }
+    const bool adjust=horizontal&&(std::abs(p.stick_was.x)<.65f||repeat);
+    if(p.selected<0){
+        if(p.advanced()&&start)p.show(p.page==Impl::GunAdvanced?Impl::Gun:Impl::World);
+        else if(!p.advanced()&&adjust){
+            p.show(Impl::Page((int(p.page)+(stick.x>0?1:3))%4));
+            p.selected=-1;
+            p.repeat_at=now+.25;
+        }
+    }else{
+        const auto& row=panel.rows[p.selected];
+        if(adjust&&(row.stepper||!row.choices.empty())){
+            p.choose(rows[p.selected],stick.x>0?1:-1,s,runtime);
+            p.repeat_at=now+.15;
+        }else if(start)p.choose(rows[p.selected],1,s,runtime);
+    }
+    p.stick_was=stick;
 }
 void Presentation::draw(const glm::mat4& vp,const Settings& s,const GameState& state,bool ready,double now,bool splash) {
     auto& p=*impl_;
@@ -230,7 +325,7 @@ void Presentation::draw(const glm::mat4& vp,const Settings& s,const GameState& s
     prepare(s);
     if(show_help&&!p.controllers_loaded) {p.controllers_loaded=true;for(int h=0;h<2;h++) {if(p.controllers[h].file(h==0?"models/controllers/left.glb":"models/controllers/right.glb",false))p.controllers[h].placement=glm::rotate(glm::mat4(1),glm::pi<float>(),glm::vec3(0,1,0));else p.controllers[h].arcade();}}
     p.init_model();bool depth_cleared=false;
-    struct Effect {glm::vec3 muzzle,direction,target,flash_muzzle,flash_direction;glm::vec4 tint;double since;int player;};
+    struct Effect {glm::vec3 muzzle,direction,target,flash_muzzle,flash_direction;glm::vec4 tint;double since;int player,hand;bool menu_contact;};
     std::vector<Effect> effects;effects.reserve(2);
     const bool shot_effects=!show_help&&!p.opened&&!p.service_mode&&p.input.focused;
     if(!shot_effects)p.gun_effects.clear();
@@ -258,19 +353,19 @@ void Presentation::draw(const glm::mat4& vp,const Settings& s,const GameState& s
         }
         auto muzzle=show_help?glm::vec3(hand_pose[3]):this->muzzle(rest,s,hand);auto direction=glm::normalize(glm::vec3((show_help?hand_pose:rest)*glm::vec4(0,0,-1,0)));auto target=muzzle+direction*3.f;
         if(!p.opened&&!show_help)if(auto hit=p.input.aim_targets[hand])target={float(hit->x),float(hit->y),float(hit->z)};
-        if(p.opened)vr::xr::rowsPanelHit(p.panel_model,p.rows(s),muzzle,direction,&target);
+        const bool menu_contact=p.opened&&hand==p.pointer.owner()&&vr::xr::settingsPanelHit(p.panel_model,p.panel(s),muzzle,direction,&target);
         glm::vec4 tint=player==0?glm::vec4(1,.15,.2,.8):glm::vec4(.2,.5,1,.8);if(p.opened)tint={.66,.61,1,.8};
         auto flash_muzzle=glm::vec3(model*glm::vec4(mesh.muzzle,1)),flash_direction=glm::normalize(glm::vec3(kicked*glm::vec4(0,0,-1,0)));
         if(shot_effects)p.gun_effects.emit(player,p.shot_time[player],now,muzzle,direction,s.gun_scale);
-        effects.push_back({muzzle,direction,target,flash_muzzle,flash_direction,tint,since,player});
+        effects.push_back({muzzle,direction,target,flash_muzzle,flash_direction,tint,since,player,hand,menu_contact});
     }
     // Both opaque guns establish depth before either player's translucent effects.
     for(const auto& effect:effects) {
         const auto& muzzle=effect.muzzle;const auto& direction=effect.direction;const auto& target=effect.target;const auto& tint=effect.tint;
-        if((s.laser&&!show_help)||p.opened) {
+        if(p.opened?effect.hand==p.pointer.owner():(s.laser&&!show_help)) {
             auto center=(muzzle+target)*.5f;glm::mat4 beam(1);auto side=glm::normalize(glm::cross(direction,glm::vec3(0,0,1)));if(!std::isfinite(side.x))side={1,0,0};
             beam[0]=glm::vec4(side,0);beam[1]=glm::vec4(direction,0);beam[2]=glm::vec4(glm::cross(side,direction),0);beam[3]=glm::vec4(center,1);
-            vr::xr::drawTexture(vp,beam,0,.0008f,glm::length(target-muzzle)*.5f,tint,true);
+            vr::xr::drawTexture(vp,beam,0,p.opened?.0008f:.0016f*(s.laser_width==3?5.f:s.laser_width==2?2.5f:1.f),glm::length(target-muzzle)*.5f,tint,true);
             if(!reticles_active(state)||s.reticle_mode==ReticleMode::Ingame)vr::xr::drawTexture(vp,glm::translate(glm::mat4(1),target),0,.006f,.006f,tint,true);
         }
     }
@@ -281,7 +376,12 @@ void Presentation::draw(const glm::mat4& vp,const Settings& s,const GameState& s
         for(const auto& e:effects)p.gun_effects.flash(vp,eye,e.player,e.since,e.flash_muzzle,e.flash_direction,s.gun_scale);
     }
     if(p.opened) {
-        vr::xr::drawRowsPanel(vp,p.panel_model,p.rows(s));
+        vr::xr::drawSettingsPanel(vp,p.panel_model,p.panel(s));
+        for(const auto& effect:effects)if(effect.menu_contact){
+            auto contact=p.panel_model;
+            contact[3]=glm::vec4(effect.target+glm::vec3(contact[2])*.003f,1);
+            vr::xr::drawTexture(vp,contact,0,.004f,.004f,glm::vec4(vr::xr::theme::Text,1));
+        };
     }
     if(p.service_mode&&!p.opened) {
         int width{},height{};auto text=!p.service_seen_native?"Entering native Service Menu...":p.service_guns?"AIM SET  Trigger: native aim setting   A / X: native Start   Right stick click: menu controls":"SERVICE  Stick down / B / Y: next   Trigger / A / X: Test select / exit";
@@ -290,12 +390,8 @@ void Presentation::draw(const glm::mat4& vp,const Settings& s,const GameState& s
     }
     // As in Confidential Mission, labels go over the scene, controllers and menu.
     if(show_help) {
-        const bool dual=state.valid&&state.players[0].joined()&&state.players[1].joined();
-        for(int hand=0;hand<2;hand++)if(p.input.hands[hand].tracked) {
-            const int start_player=start_help_player(state,hand,s.p1_hand);
-            const int gun_player=dual?start_player:(state.valid&&!state.players[0].joined()&&state.players[1].joined()?1:0);
-            p.controller_labels.draw(vp,hand,p.input.poses[hand]*p.controllers[hand].placement,start_player,gun_player);
-        }
+        for(int hand=0;hand<2;hand++)if(p.input.hands[hand].tracked)
+            p.controller_labels.draw(vp,hand,p.input.poses[hand]*p.controllers[hand].placement);
     }
 }
 }

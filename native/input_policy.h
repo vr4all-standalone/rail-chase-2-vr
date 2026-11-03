@@ -10,6 +10,7 @@ enum class BackgroundMode {Original,Depth3D};
 inline constexpr std::array<float,4> HapticLevels{0,.35f,.65f,1};
 inline int haptic_level(float value){int best=0;for(int i=1;i<4;i++)if(std::abs(value-HapticLevels[i])<std::abs(value-HapticLevels[best]))best=i;return best;}
 struct Settings {
+    int laser_width{1}; // Normal, 5x, 10x
     int p1_hand{0};std::array<Calibration,2> calibration=NativeRanges;
     float world_scale{.055f},panel_distance{1.8f},hud_size{1.f},gun_angle{},gun_scale{1},haptics{.65f},view_fov{55};
     bool laser{true},wider_view{true},cart_bottom{true};int gun{};
@@ -77,10 +78,13 @@ class InputPolicy {
     std::array<int,2> start_owner_{-1,-1};
     bool initialized_{},was_enabled_{},was_ready_{};
     uint8_t previous_joined_{};
-    int previous_layout_{0},solo_hand_{0};
+    int previous_layout_{0},solo_hand_{-1};
     double previous_time_{};
 public:
-    void suspend(){*this=InputPolicy{};}
+    void suspend(){
+        const int owner=solo_hand_,layout=previous_layout_;const auto joined=previous_joined_;
+        *this=InputPolicy{};solo_hand_=owner;previous_layout_=layout;previous_joined_=joined;
+    }
     template<class State> CabinetInput update(double now,const Hands& hands,const State& state,
                         const Settings& settings,bool focused,bool menu,const ShotOwnership* ownership=nullptr) {
         NativeState native;native.valid=state.valid;native.start_ready=state.ready;
@@ -104,7 +108,7 @@ public:
         const bool session_changed=initialized_&&state.session!=previous_state_.session;
         const bool transition=!initialized_||enabled!=was_enabled_||joined!=previous_joined_||layout!=previous_layout_||session_changed;
         if(transition){blocked_={true,true};outside_pull_={};}
-        if(!initialized_||layout!=previous_layout_)solo_hand_=layout;
+        if(solo_hand_<0||layout!=previous_layout_)solo_hand_=joined==2?1-layout:layout;
         if(joined==3)solo_hand_=layout;
         else if(previous_joined_==3 && joined==2)solo_hand_=1-layout;
         const int previous_solo=solo_hand_;
@@ -112,6 +116,10 @@ public:
             const int other=1-solo_hand_;
             if(!hands[solo_hand_].trigger&&hands[other].tracked&&
                (!hands[solo_hand_].tracked || (hands[other].trigger&&!previous_[other].trigger&&!transition)))solo_hand_=other;
+        }
+        if(joined==0&&ready&&was_ready_&&layout==previous_layout_&&!session_changed){
+            const auto first=[&](int h){return hands[h].tracked&&!start_waiting_[h]&&hands[h].start&&!previous_[h].start;};
+            if(first(0)||first(1))solo_hand_=first(0)&&first(1)?layout:first(0)?0:1;
         }
         if(solo_hand_!=previous_solo&&previous_[solo_hand_].trigger)blocked_[solo_hand_]=true;
         if(joined==3)out.hand={layout,1-layout};
@@ -135,7 +143,8 @@ public:
             if(ready&&in.tracked&&!in.start)start_waiting_[h]=false;
             if(!in.start)start_owner_[h]=-1;
             if(ready&&in.tracked&&!start_waiting_[h]&&in.start&&!previous_[h].start) {
-                const int player=joined==0?(state.played_mask==2?1:state.played_mask==3?(h==layout?0:1):0):(h==layout?0:1);
+                const int active=joined==2?1:0;
+                const int player=joined==0?(state.played_mask==2?1:state.played_mask==3?(h==layout?0:1):0):joined==3?(h==layout?0:1):(h==solo_hand_?active:1-active);
                 if(player==0 || (state.played_mask&(1<<player)) || joined==3 || ((joined&1)&&hands[0].tracked&&hands[1].tracked)) {
                     start_owner_[h]=player;
                     auto& pulse=pulses_[h];

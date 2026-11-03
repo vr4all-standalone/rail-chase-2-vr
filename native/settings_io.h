@@ -18,6 +18,7 @@ inline Settings read_settings(std::istream& input,bool* migrated=nullptr) {
         else if(key=="p1_hand"&&integer(0,1)){has_hand=true;selected_hand=int(number);}
         else if(key=="gun"&&integer(0,2))out.gun=int(number);
         else if(key=="laser"&&integer(0,1))out.laser=number!=0;
+        else if(key=="laser_width"&&integer(1,3))out.laser_width=number;
         else if(key=="cart_bottom"&&integer(0,1))out.cart_bottom=number!=0;
         else if(key=="wider_view"&&integer(0,1)){has_wider=true;selected_wider=number!=0;}
         else if(key=="background"&&integer(0,1))out.background=BackgroundMode(int(number));
@@ -49,6 +50,6 @@ inline Settings read_settings(std::istream& input,bool* migrated=nullptr) {
 }
 inline void write_settings(std::ostream& out,const Settings& s) {
     out<<"version=4\ngun_angle_zero_version=1\np1_hand="<<s.p1_hand<<"\ngun="<<s.gun<<"\nlaser="<<s.laser<<"\ncart_bottom="<<s.cart_bottom
-       <<"\nview_fov="<<s.view_fov<<"\nwider_view="<<s.wider_view<<"\nworld_scale="<<s.world_scale<<"\npanel_distance="<<s.panel_distance<<"\nhud_size="<<s.hud_size<<"\ngun_angle="<<s.gun_angle<<"\ngun_scale="<<s.gun_scale<<"\nreticle_mode="<<int(s.reticle_mode)<<"\nreticle_min_size="<<s.reticle_min_size<<"\nreticle_max_size="<<s.reticle_max_size<<"\nreticle_custom_min_size="<<s.reticle_custom_min_size<<"\nreticle_custom_max_size="<<s.reticle_custom_max_size<<"\nreticle_shrink_distance="<<s.reticle_shrink_distance<<"\nhaptics="<<s.haptics<<"\nbackground="<<int(s.background)<<'\n';
+       <<"\nlaser_width="<<s.laser_width<<"\nview_fov="<<s.view_fov<<"\nwider_view="<<s.wider_view<<"\nworld_scale="<<s.world_scale<<"\npanel_distance="<<s.panel_distance<<"\nhud_size="<<s.hud_size<<"\ngun_angle="<<s.gun_angle<<"\ngun_scale="<<s.gun_scale<<"\nreticle_mode="<<int(s.reticle_mode)<<"\nreticle_min_size="<<s.reticle_min_size<<"\nreticle_max_size="<<s.reticle_max_size<<"\nreticle_custom_min_size="<<s.reticle_custom_min_size<<"\nreticle_custom_max_size="<<s.reticle_custom_max_size<<"\nreticle_shrink_distance="<<s.reticle_shrink_distance<<"\nhaptics="<<s.haptics<<"\nbackground="<<int(s.background)<<'\n';
 }
 }

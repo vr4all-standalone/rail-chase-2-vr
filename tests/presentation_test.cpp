@@ -23,18 +23,23 @@ int main(int argc,char** argv){
     }
     GLContext context;
     {
-        _putenv_s("RCHASE2_SETTINGS","hud-menu-test.ini");Presentation hudmenu;Settings values;SharedRuntime isolated;PresentationInput buttons;double tick=0;
+        _putenv_s("RCHASE2_SETTINGS","hud-menu-test.ini");Presentation hudmenu;Settings values;SharedRuntime isolated;PresentationInput buttons;double tick=0;buttons.hands[0].tracked=true;buttons.poses[0][3].x=10;
         auto update=[&]{tick+=.05;hudmenu.update(buttons,values,isolated,tick);};
-        auto step=[&](glm::vec2 direction){buttons.stick=direction;update();buttons.stick={};update();};
+        auto step=[&](glm::vec2 direction){buttons.sticks[0]=direction;update();buttons.sticks[0]={};update();};
         update();buttons.toggle=true;update();buttons.toggle=false;update();
-        for(int i=0;i<14;i++)step({0,-1});
+        auto press=[&]{buttons.hands[0].start=true;update();buttons.hands[0].start=false;update();};
+        step({0,1});step({1,0});step({0,-1});step({0,-1});press();
+        step({0,-1});step({0,-1});
         step({1,0});check(values.hud_size==1.05f,"HUD size immediately after distance changes in5% steps");
         for(int i=0;i<30;i++)step({1,0});check(values.hud_size==2,"HUD size clamps at200%");
         for(int i=0;i<40;i++)step({-1,0});check(values.hud_size==.5f,"HUD size clamps at50%");
         std::ifstream file("hud-menu-test.ini");auto cold=read_settings(file);file.close();check(cold.hud_size==.5f,"actual HUD menu save/load");
         check(values.world_scale==Settings{}.world_scale&&values.panel_distance==Settings{}.panel_distance&&values.p1_hand==Settings{}.p1_hand,"HUD menu does not change world, distance or hand");
-        for(int i=0;i<9;i++)step({0,1});step({1,0});check(values.p1_hand==1&&values.hud_size==.5f,"hand menu transition retains HUD preference");
-        for(int i=5;i<21;i++)step({0,-1});buttons.hands[0].start=true;update();buttons.hands[0].start=false;update();check(values.hud_size==1&&values.p1_hand==Settings{}.p1_hand,"Reset restores HUD100 and hand defaults");
+        for(int i=0;i<3;i++)step({0,1});press();
+        step({0,1});step({1,0});step({0,-1});step({1,0});
+        check(values.p1_hand==1&&values.hud_size==.5f,"hand menu transition retains HUD preference");
+        for(int i=0;i<3;i++)step({0,-1});press();step({0,-1});press();
+        check(values.hud_size==1&&values.p1_hand==Settings{}.p1_hand,"Reset restores HUD100 and hand defaults");
         std::ifstream resetfile("hud-menu-test.ini");auto resetcold=read_settings(resetfile);resetfile.close();check(resetcold.hud_size==1,"actual Reset persists HUD100");
         std::filesystem::remove("hud-menu-test.ini");_putenv_s("RCHASE2_SETTINGS","");
     }
@@ -43,20 +48,21 @@ int main(int argc,char** argv){
         auto settings_file=std::filesystem::current_path()/"reticle-menu-test.ini";
         const char* previous=std::getenv("RCHASE2_SETTINGS");std::string previous_name=previous?previous:"";
         _putenv_s("RCHASE2_SETTINGS",settings_file.string().c_str());
-        Presentation tuning;PresentationInput buttons;Settings values;SharedRuntime isolated;double tick=0;
+        Presentation tuning;PresentationInput buttons;Settings values;SharedRuntime isolated;double tick=0;buttons.hands[0].tracked=true;buttons.poses[0][3].x=10;
         tuning.update(buttons,values,isolated,tick++);buttons.toggle=true;tuning.update(buttons,values,isolated,tick++);
         buttons.toggle=false;tuning.update(buttons,values,isolated,tick++);
-        auto step=[&](glm::vec2 stick){buttons.stick=stick;tuning.update(buttons,values,isolated,tick++);buttons.stick={};tuning.update(buttons,values,isolated,tick++);};
-        for(int i=0;i<7;i++)step({0,-1});
+        auto step=[&](glm::vec2 stick){buttons.sticks[0]=stick;tuning.update(buttons,values,isolated,tick++);buttons.sticks[0]={};tuning.update(buttons,values,isolated,tick++);};
+        auto press=[&]{buttons.hands[0].start=true;tuning.update(buttons,values,isolated,tick++);buttons.hands[0].start=false;tuning.update(buttons,values,isolated,tick++);};
+        for(int i=0;i<3;i++)step({0,-1});
         step({1,0});check(values.reticle_mode==ReticleMode::Custom,"Reticle selector cycles from In-game to Custom");
         step({1,0});check(values.reticle_mode==ReticleMode::None,"Reticle selector includes None");
-        step({0,-1});step({1,0});step({0,-1});step({1,0});
+        step({0,-1});step({0,-1});press();step({0,-1});step({1,0});step({0,-1});step({1,0});
         check(values.reticle_min_size==.35f&&values.reticle_max_size==1.f
             &&values.reticle_custom_min_size==.35f&&values.reticle_custom_max_size==1.f,
             "None artwork cannot change either mode's saved size");
-        step({0,1});step({0,1});
-        step({-1,0});check(values.reticle_mode==ReticleMode::Custom,"Reticle selector cycles backward");
-        step({0,-1});
+        for(int i=0;i<3;i++)step({0,1});press();
+        for(int i=0;i<3;i++)step({0,-1});step({-1,0});check(values.reticle_mode==ReticleMode::Custom,"Reticle selector cycles backward");
+        step({0,-1});step({0,-1});press();step({0,-1});
         step({1,0});check(values.reticle_custom_min_size==.36f&&values.reticle_min_size==.35f,"Custom minimum changes without changing In-game minimum");
         step({0,-1});step({1,0});
         check(values.reticle_custom_max_size==1.05f&&values.reticle_max_size==1.f,"Custom maximum changes in five-percent steps without changing In-game maximum");
@@ -71,36 +77,36 @@ int main(int argc,char** argv){
     {
         const auto saved=std::filesystem::current_path()/"cart-bottom-menu-test.ini";
         _putenv_s("RCHASE2_SETTINGS",saved.string().c_str());
-        Presentation menu;Settings option;SharedRuntime bridge;PresentationInput controls;double time=0;
+        Presentation menu;Settings option;SharedRuntime bridge;PresentationInput controls;double time=0;controls.hands[0].tracked=true;controls.poses[0][3].x=10;
         auto update=[&](){time+=.05;menu.update(controls,option,bridge,time);};
         update();controls.toggle=true;update();controls.toggle=false;update();
-        auto down=[&](){controls.stick={0,-1};update();controls.stick={0,0};update();};
-        auto choose=[&](){controls.stick={1,0};update();controls.stick={0,0};update();};
-        for(int row=0;row<18;row++)down();choose();
-        check(!option.cart_bottom,"Cart bottom follows View width and toggles Off through the actual menu");
+        auto step=[&](glm::vec2 stick){controls.sticks[0]=stick;update();controls.sticks[0]={};update();};
+        auto press=[&]{controls.hands[0].start=true;update();controls.hands[0].start=false;update();};
+        auto tab=[&](int right){step({0,1});for(int i=0;i<right;i++)step({1,0});step({0,-1});};
+        tab(1);step({0,-1});press();for(int i=0;i<4;i++)step({0,-1});step({1,0});
+        check(!option.cart_bottom,"Cart bottom toggles Off in Advanced World");
         std::ifstream file(saved);auto cold=read_settings(file);file.close();
         check(!cold.cart_bottom,"the actual menu saves Cart bottom Off for the next launch");
-        down();choose();check(menu.open()&&!bridge.service_requested&&!bridge.quit_requested,"How to play follows Cart bottom");
-        down();choose();check(bridge.service_requested&&!menu.open(),"shifted Service row still sends native Service request");
-        controls.toggle=true;update();controls.toggle=false;update();
-        for(int row=0;row<22;row++)down();choose();
-        check(!bridge.quit_requested,"shifted Quit row still requires confirmation");choose();
-        check(bridge.quit_requested,"shifted Quit row confirms on the second selection");
+        for(int i=0;i<5;i++)step({0,1});press();tab(1);
+        step({0,-1});press();check(bridge.service_requested&&!menu.open(),"Service sends native request");
+        controls.toggle=true;update();controls.toggle=false;update();tab(2);
+        for(int i=0;i<4;i++)step({0,-1});press();check(!bridge.quit_requested,"Quit requires confirmation");
+        step({0,-1});press();check(bridge.quit_requested,"Quit confirms on the second selection");
         std::filesystem::remove(saved);_putenv_s("RCHASE2_SETTINGS","");
     }
     {
         const auto saved=std::filesystem::current_path()/"reset-menu-test.ini";
         _putenv_s("RCHASE2_SETTINGS",saved.string().c_str());
-        Presentation menu;Settings option;SharedRuntime bridge;PresentationInput controls;double time=0;
+        Presentation menu;Settings option;SharedRuntime bridge;PresentationInput controls;double time=0;controls.hands[0].tracked=true;controls.poses[0][3].x=10;
         option.laser=false;option.reticle_mode=ReticleMode::Custom;
         option.reticle_custom_min_size=.48f;option.reticle_custom_max_size=2.f;
         option.cart_bottom=false;option.p1_hand=1;option.hud_size=2;
         auto update=[&](){time+=.05;menu.update(controls,option,bridge,time);};
         update();controls.toggle=true;update();controls.toggle=false;update();
-        for(int row=0;row<21;row++){
-            controls.stick={0,-1};update();controls.stick={};update();
-        }
-        controls.hands[0].start=true;update();controls.hands[0].start=false;update();
+        auto step=[&](glm::vec2 stick){controls.sticks[0]=stick;update();controls.sticks[0]={};update();};
+        auto press=[&]{controls.hands[0].start=true;update();controls.hands[0].start=false;update();};
+        step({0,1});step({1,0});step({1,0});for(int i=0;i<4;i++)step({0,-1});
+        press();step({0,-1});press();
         check(option.laser==Settings{}.laser&&option.reticle_mode==Settings{}.reticle_mode
             &&option.reticle_custom_min_size==Settings{}.reticle_custom_min_size
             &&option.reticle_custom_max_size==Settings{}.reticle_custom_max_size

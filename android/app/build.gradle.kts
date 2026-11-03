@@ -15,8 +15,8 @@ android {
         applicationId = "com.vrlightgunhub.rchase2"
         minSdk = 29
         targetSdk = 36
-        versionCode = 9
-        versionName = "0.1.0-beta"
+        versionCode = 10
+        versionName = "0.1.1-beta"
         ndk { abiFilters += "arm64-v8a" }
     }
     signingConfigs { create("local") {
